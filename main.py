@@ -1,4 +1,4 @@
-# Penelope
+# Penelope Assistant
 
 import pdfplumber
 from langchain.text_splitter import RecursiveCharacterTextSplitter
