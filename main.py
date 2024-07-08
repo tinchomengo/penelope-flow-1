@@ -1,6 +1,8 @@
 import os
 import json
 import pdfplumber
+import pytesseract
+from PIL import Image
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -93,6 +95,15 @@ def fetch_pdf_content(pdf_path):
             text += page.extract_text() + "\n"
     return text
 
+# Fetch content from images using OCR
+def fetch_image_content(image_path):
+    try:
+        text = pytesseract.image_to_string(Image.open(image_path))
+        return text
+    except Exception as e:
+        print(f"An error occurred while processing the image: {e}")
+        return ""
+
 # Download a file from Google Drive
 def download_file(drive_service, file_id, file_path):
     request = drive_service.files().get_media(fileId=file_id)
@@ -155,6 +166,10 @@ for file in files:
         paragraphs += paragraph_text
     elif file_mime_type == 'application/vnd.google-apps.spreadsheet':
         all_text.extend(fetch_google_sheet_content(sheets_service, file_id))
+    elif file_mime_type in ['image/png', 'image/jpeg', 'image/jpg']:
+        file_path = f"./documents/{file_name}"
+        download_file(drive_service, file_id, file_path)
+        paragraphs += fetch_image_content(file_path)
 
 # Convert the matrix into a string for vectorization
 flat_text = '\n'.join([','.join(row) for row in all_text]) + "\n" + paragraphs
