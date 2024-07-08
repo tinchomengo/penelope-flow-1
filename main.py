@@ -1,53 +1,76 @@
-# Penelope Assistant
-
+import os
+import json
 import pdfplumber
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-#from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_huggingface import HuggingFaceEmbeddings
-import dotenv
-import os
-#from langchain_community.chat_models import ChatOpenAI
 from langchain_openai import ChatOpenAI
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.chains import create_retrieval_chain
 from langchain import hub
-from pydrive.auth import GoogleAuth
-from pydrive.drive import GoogleDrive
-from oauth2client.service_account import ServiceAccountCredentials
+import dotenv
 
 dotenv.load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-print("\nLoading...")
+print("Loading...")
 
-# Authenticate and create the PyDrive client using a service account
+# Authenticate and create the Google Drive client using a service account
 def authenticate_google_drive():
-    scope = ['https://www.googleapis.com/auth/drive']
-    creds = ServiceAccountCredentials.from_json_keyfile_name('service_account.json', scope)
-    gauth = GoogleAuth()
-    gauth.credentials = creds
-    drive = GoogleDrive(gauth)
-    return drive
+    scope = ['https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/spreadsheets.readonly']
+    creds = Credentials.from_service_account_file('service_account.json', scopes=scope)
+    drive_service = build('drive', 'v3', credentials=creds)
+    sheets_service = build('sheets', 'v4', credentials=creds)
+    return drive_service, sheets_service
 
-# Fetch PDF files from a specified Google Drive folder
-def fetch_pdfs_from_drive_folder(drive, folder_id):
-    file_list = drive.ListFile({'q': f"'{folder_id}' in parents and mimeType contains 'application/pdf'"}).GetList()
-    pdf_files = []
-    for file in file_list:
-        file_path = os.path.join("./documents", file['title'])
-        file.GetContentFile(file_path)
-        pdf_files.append(file_path)
-    return pdf_files
+# Fetch files from a specified Google Drive folder
+def fetch_files_from_drive_folder(drive_service, folder_id):
+    query = f"'{folder_id}' in parents and (mimeType='application/pdf' or mimeType='application/vnd.google-apps.document' or mimeType='application/vnd.google-apps.spreadsheet')"
+    results = drive_service.files().list(q=query).execute()
+    return results.get('files', [])
 
-# Parsing a local PDF file
-def extract_text_from_pdf(pdf_path):
+# Fetch content from Google Docs
+def fetch_google_doc_content(drive_service, file_id):
+    doc = drive_service.files().export(fileId=file_id, mimeType='text/plain').execute()
+    return doc.decode('utf-8')
+
+# Fetch content from Google Sheets
+def fetch_google_sheet_content(sheets_service, file_id):
+    try:
+        sheet_metadata = sheets_service.spreadsheets().get(spreadsheetId=file_id).execute()
+        sheet_names = [sheet['properties']['title'] for sheet in sheet_metadata['sheets']]
+        
+        all_text = ""
+        for sheet_name in sheet_names:
+            result = sheets_service.spreadsheets().values().get(spreadsheetId=file_id, range=sheet_name).execute()
+            values = result.get('values', [])
+            all_text += '\n'.join([','.join(row) for row in values])
+        return all_text
+    except Exception as e:
+        print(f"An error occurred while fetching Google Sheets content: {e}")
+        return ""
+
+# Fetch content from PDF files
+def fetch_pdf_content(pdf_path):
     text = ""
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
             text += page.extract_text() + "\n"
     return text
+
+# Download a file from Google Drive
+def download_file(drive_service, file_id, file_path):
+    request = drive_service.files().get_media(fileId=file_id)
+    with open(file_path, 'wb') as file:
+        downloader = MediaIoBaseDownload(file, request)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+    return file_path
 
 # Splitting text into chunks
 def split_text_into_chunks(text, chunk_size=1000, chunk_overlap=200):
@@ -57,7 +80,6 @@ def split_text_into_chunks(text, chunk_size=1000, chunk_overlap=200):
 
 # Vectorizing chunks with HuggingFaceEmbeddings
 def vectorize_chunks(chunks):
-    # Use HuggingFaceEmbeddings instead of OpenAIEmbeddings
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
     vectorstore = FAISS.from_texts(chunks, embeddings)
     return vectorstore
@@ -77,24 +99,32 @@ def interact_with_llm(chain, query):
     return result['answer']
 
 # Authenticate Google Drive
-drive = authenticate_google_drive()
+drive_service, sheets_service = authenticate_google_drive()
 
 folder_id = os.getenv("FOLDER_ID")
 
-# Fetch PDF files from the specified folder
-pdf_files = fetch_pdfs_from_drive_folder(drive, folder_id)
+# Fetch files from the specified folder
+files = fetch_files_from_drive_folder(drive_service, folder_id)
 
-# Process each PDF file
+# Process each file
 all_text = ""
-for pdf_file in pdf_files:
-    all_text += extract_text_from_pdf(pdf_file)
+for file in files:
+    file_id = file['id']
+    file_name = file['name']
+    file_mime_type = file['mimeType']
+    
+    if file_mime_type == 'application/pdf':
+        file_path = f"./documents/{file_name}"
+        download_file(drive_service, file_id, file_path)
+        all_text += fetch_pdf_content(file_path)
+    elif file_mime_type == 'application/vnd.google-apps.document':
+        all_text += fetch_google_doc_content(drive_service, file_id)
+    elif file_mime_type == 'application/vnd.google-apps.spreadsheet':
+        all_text += fetch_google_sheet_content(sheets_service, file_id)
 
-#all_text = "./documents/ThehistoryofBitcoinpdf.pdf"
-#text = extract_text_from_pdf(all_text)
 chunks = split_text_into_chunks(all_text)
 vectorstore = vectorize_chunks(chunks)
 chain = create_custom_retrieval_chain(vectorstore)
-
 
 flag = False
 
@@ -107,4 +137,3 @@ while True:
         break
     answer = interact_with_llm(chain, query)
     print(answer)
-
