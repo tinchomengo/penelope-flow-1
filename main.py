@@ -28,11 +28,20 @@ def authenticate_google_drive():
     sheets_service = build('sheets', 'v4', credentials=creds)
     return drive_service, docs_service, sheets_service
 
-# Fetch files from a specified Google Drive folder
-def fetch_files_from_drive_folder(drive_service, folder_id):
-    query = f"'{folder_id}' in parents and (mimeType='application/pdf' or mimeType='application/vnd.google-apps.document' or mimeType='application/vnd.google-apps.spreadsheet')"
+# Recursive function to fetch files from all folders
+def fetch_all_files(drive_service, folder_id):
+    query = f"'{folder_id}' in parents and trashed=false"
     results = drive_service.files().list(q=query).execute()
-    return results.get('files', [])
+    items = results.get('files', [])
+    
+    all_files = []
+    for item in items:
+        if item['mimeType'] == 'application/vnd.google-apps.folder':
+            all_files.extend(fetch_all_files(drive_service, item['id']))
+        else:
+            all_files.append(item)
+    
+    return all_files
 
 # Fetch content from Google Docs
 def fetch_google_doc_content(docs_service, file_id):
@@ -125,8 +134,8 @@ drive_service, docs_service, sheets_service = authenticate_google_drive()
 
 folder_id = os.getenv("FOLDER_ID")
 
-# Fetch files from the specified folder
-files = fetch_files_from_drive_folder(drive_service, folder_id)
+# Fetch all files from the specified folder and its subfolders
+files = fetch_all_files(drive_service, folder_id)
 
 # Process each file
 all_text = []
