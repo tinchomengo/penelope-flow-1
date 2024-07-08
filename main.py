@@ -21,11 +21,12 @@ print("Loading...")
 
 # Authenticate and create the Google Drive client using a service account
 def authenticate_google_drive():
-    scope = ['https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/spreadsheets.readonly']
+    scope = ['https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/spreadsheets.readonly', 'https://www.googleapis.com/auth/documents.readonly']
     creds = Credentials.from_service_account_file('service_account.json', scopes=scope)
     drive_service = build('drive', 'v3', credentials=creds)
+    docs_service = build('docs', 'v1', credentials=creds)
     sheets_service = build('sheets', 'v4', credentials=creds)
-    return drive_service, sheets_service
+    return drive_service, docs_service, sheets_service
 
 # Fetch files from a specified Google Drive folder
 def fetch_files_from_drive_folder(drive_service, folder_id):
@@ -34,25 +35,46 @@ def fetch_files_from_drive_folder(drive_service, folder_id):
     return results.get('files', [])
 
 # Fetch content from Google Docs
-def fetch_google_doc_content(drive_service, file_id):
-    doc = drive_service.files().export(fileId=file_id, mimeType='text/plain').execute()
-    return doc.decode('utf-8')
+def fetch_google_doc_content(docs_service, file_id):
+    document = docs_service.documents().get(documentId=file_id).execute()
+    content = document.get('body').get('content')
+    paragraph_text = ""
+    table_matrix = []
+    for element in content:
+        if 'table' in element:
+            for row in element.get('table').get('tableRows'):
+                row_text = []
+                for cell in row.get('tableCells'):
+                    cell_text = ""
+                    for text_run in cell.get('content'):
+                        if 'paragraph' in text_run:
+                            for elem in text_run.get('paragraph').get('elements'):
+                                cell_text += elem.get('textRun').get('content').strip()
+                    row_text.append(cell_text)
+                table_matrix.append(row_text)
+        elif 'paragraph' in element:
+            for elem in element.get('paragraph').get('elements'):
+                paragraph_text += elem.get('textRun').get('content').strip()
+
+    return table_matrix, paragraph_text
 
 # Fetch content from Google Sheets
 def fetch_google_sheet_content(sheets_service, file_id):
     try:
+        # Get sheet metadata
         sheet_metadata = sheets_service.spreadsheets().get(spreadsheetId=file_id).execute()
         sheet_names = [sheet['properties']['title'] for sheet in sheet_metadata['sheets']]
         
-        all_text = ""
+        all_text = []
         for sheet_name in sheet_names:
             result = sheets_service.spreadsheets().values().get(spreadsheetId=file_id, range=sheet_name).execute()
             values = result.get('values', [])
-            all_text += '\n'.join([','.join(row) for row in values])
+            all_text.extend(values)
+        
         return all_text
     except Exception as e:
         print(f"An error occurred while fetching Google Sheets content: {e}")
-        return ""
+        return []
 
 # Fetch content from PDF files
 def fetch_pdf_content(pdf_path):
@@ -99,7 +121,7 @@ def interact_with_llm(chain, query):
     return result['answer']
 
 # Authenticate Google Drive
-drive_service, sheets_service = authenticate_google_drive()
+drive_service, docs_service, sheets_service = authenticate_google_drive()
 
 folder_id = os.getenv("FOLDER_ID")
 
@@ -107,7 +129,8 @@ folder_id = os.getenv("FOLDER_ID")
 files = fetch_files_from_drive_folder(drive_service, folder_id)
 
 # Process each file
-all_text = ""
+all_text = []
+paragraphs = ""
 for file in files:
     file_id = file['id']
     file_name = file['name']
@@ -116,13 +139,18 @@ for file in files:
     if file_mime_type == 'application/pdf':
         file_path = f"./documents/{file_name}"
         download_file(drive_service, file_id, file_path)
-        all_text += fetch_pdf_content(file_path)
+        all_text.append([fetch_pdf_content(file_path)])
     elif file_mime_type == 'application/vnd.google-apps.document':
-        all_text += fetch_google_doc_content(drive_service, file_id)
+        table_matrix, paragraph_text = fetch_google_doc_content(docs_service, file_id)
+        all_text.extend(table_matrix)
+        paragraphs += paragraph_text
     elif file_mime_type == 'application/vnd.google-apps.spreadsheet':
-        all_text += fetch_google_sheet_content(sheets_service, file_id)
+        all_text.extend(fetch_google_sheet_content(sheets_service, file_id))
 
-chunks = split_text_into_chunks(all_text)
+# Convert the matrix into a string for vectorization
+flat_text = '\n'.join([','.join(row) for row in all_text]) + "\n" + paragraphs
+
+chunks = split_text_into_chunks(flat_text)
 vectorstore = vectorize_chunks(chunks)
 chain = create_custom_retrieval_chain(vectorstore)
 
